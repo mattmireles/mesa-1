@@ -26,6 +26,7 @@ bool agx_nir_lower_fdiv(struct nir_shader *s);
 bool agx_nir_lower_fdiv_late(struct nir_shader *s);
 bool agx_nir_lower_log(struct nir_shader *s);
 bool agx_nir_lower_sincos(struct nir_shader *s);
+bool agx_nir_fold_shared_offsets(struct nir_shader *s);
 
 bool agx_nir_lower_texture_early(struct nir_shader *s, bool support_lod_bias);
 bool agx_nir_lower_texture(struct nir_shader *s);

@@ -2869,11 +2869,11 @@ agx_peel_const(nir_builder *b, nir_def *def, int64_t *c)
       nir_scalar a = nir_scalar_chase_alu_src(s, 0);
       nir_scalar bb = nir_scalar_chase_alu_src(s, 1);
       if (nir_scalar_is_const(bb)) {
-         *c += (int64_t)nir_scalar_as_uint(bb);
+         *c += nir_scalar_as_int(bb);
          return agx_peel_const(b, a.def, c);
       }
       if (nir_scalar_is_const(a)) {
-         *c += (int64_t)nir_scalar_as_uint(a);
+         *c += nir_scalar_as_int(a);
          return agx_peel_const(b, bb.def, c);
       }
    }
@@ -2993,6 +2993,13 @@ agx_fold_shared_offsets(nir_shader *nir)
       nir_progress(progress, impl, nir_metadata_none);
    }
    return progress;
+}
+
+/* Exported for the unit tests. */
+bool
+agx_nir_fold_shared_offsets(nir_shader *nir)
+{
+   return agx_fold_shared_offsets(nir);
 }
 
 static bool

@@ -10,6 +10,8 @@ extern "C" {
 }
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <vector>
 
 /*
  * Behavioral pins for the float-control keying in agx_nir_lower_math.c.
@@ -216,4 +218,45 @@ TEST_F(LowerMathTest, SinZeroPathNumericalArtifact)
    const uint32_t normal = 0x3f800000u; /* 1.0 */
    const bool zero_compare_normal = false;
    EXPECT_EQ(zero_compare_normal ? 0x80000000u : normal, normal);
+}
+
+/* The shared-memory offset fold must keep the sign of a constant addend. A
+ * 16-bit add of 0xfff0 is x - 16: the group {x, x - 16} must come out as
+ * constant offsets {0, -16} from x, never {0, +65520}, which the hardware
+ * index add (it does not wrap) would turn into a different address. */
+TEST_F(LowerMathTest, SharedFoldKeepsNegativeAddends)
+{
+   nir_def *x = nir_undef(&b, 1, 16);
+   nir_def *lo = nir_iadd_imm(&b, x, 0xfff0);
+   nir_load_shared(&b, 1, 32, x, .base = 0, .align_mul = 4);
+   nir_load_shared(&b, 1, 32, lo, .base = 0, .align_mul = 4);
+
+   EXPECT_TRUE(agx_nir_fold_shared_offsets(b.shader));
+
+   std::vector<int64_t> totals;
+   nir_foreach_function_impl(impl, b.shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            if (intr->intrinsic != nir_intrinsic_load_shared)
+               continue;
+
+            int64_t total = nir_intrinsic_base(intr);
+            nir_scalar a = nir_scalar_resolved(intr->src[0].ssa, 0);
+            if (nir_scalar_is_alu(a) && nir_scalar_alu_op(a) == nir_op_iadd) {
+               nir_scalar k = nir_scalar_chase_alu_src(a, 1);
+               if (nir_scalar_is_const(k))
+                  total += nir_scalar_as_int(k);
+            }
+            totals.push_back(total);
+         }
+      }
+   }
+
+   ASSERT_EQ(totals.size(), 2u);
+   std::sort(totals.begin(), totals.end());
+   EXPECT_EQ(totals[0], -16);
+   EXPECT_EQ(totals[1], 0);
 }
