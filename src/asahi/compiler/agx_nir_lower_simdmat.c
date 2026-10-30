@@ -46,6 +46,7 @@
  */
 
 #include "util/macros.h"
+#include "util/u_debug.h"
 #include "compiler/nir/nir_builder.h"
 #include "agx_compiler.h"
 
@@ -566,4 +567,58 @@ agx_nir_lower_simdmat(nir_shader *shader, unsigned subgroup_size)
 
    _mesa_hash_table_destroy(tm, NULL);
    return progress;
+}
+
+/* Fold fp16 -> fp32 conversions into the A/B operands of an fp32-accumulator
+ * matrix MAC. A/B carry their own size bits, so simd_matrix_fmadd32 reads a
+ * 16-bit source pair directly (as it does for the fp16 A/B, fp32 C form),
+ * and the two f2f32 per operand (emitted as fadd x, -0.0) disappear. This
+ * reaches the fp32 A x fp16 B form that the cooperative-matrix API cannot
+ * express (A, B and C types are advertised per shape, same type for A and
+ * B). An fp16 -> fp32 conversion is exact, so the product is unchanged as
+ * long as the unit widens 16-bit sources exactly; that is gated physically.
+ * Runs on scalarized NIR. AGX_SIMDMAT_FOLD=0 disables it.
+ */
+static bool
+fold_operand(nir_builder *b, nir_intrinsic_instr *intr, unsigned s)
+{
+   nir_def *v = intr->src[s].ssa;
+   if (v->bit_size != 32 || v->num_components != 2)
+      return false;
+
+   nir_scalar h[2];
+   for (unsigned c = 0; c < 2; c++) {
+      nir_scalar x = nir_scalar_resolved(v, c);
+      if (!nir_scalar_is_alu(x) || nir_scalar_alu_op(x) != nir_op_f2f32)
+         return false;
+      h[c] = nir_scalar_chase_alu_src(x, 0);
+      if (h[c].def->bit_size != 16)
+         return false;
+   }
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[s], nir_vec_scalars(b, h, 2));
+   return true;
+}
+
+static bool
+fold_f2f32(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_simd_matrix_fmadd_agx ||
+       intr->def.bit_size != 32)
+      return false;
+
+   bool progress = fold_operand(b, intr, 0);
+   progress |= fold_operand(b, intr, 1);
+   return progress;
+}
+
+bool
+agx_nir_fold_simdmat_f2f32(nir_shader *shader)
+{
+   if (!debug_get_bool_option("AGX_SIMDMAT_FOLD", true))
+      return false;
+
+   return nir_shader_intrinsics_pass(shader, fold_f2f32,
+                                     nir_metadata_control_flow, NULL);
 }
