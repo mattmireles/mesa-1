@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include "compiler/nir/nir_builder.h"
+#include "agx_compile.h"
 #include "agx_nir.h"
 #include "nir.h"
 #include "nir_intrinsics.h"
@@ -150,6 +151,120 @@ pass(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return true;
 }
 
+static bool
+is_alu_op(nir_scalar s, nir_op op)
+{
+   return nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == op;
+}
+
+static unsigned
+block_uses(nir_def *def, nir_block *block)
+{
+   unsigned n = 0;
+   nir_foreach_use(src, def)
+      n += nir_src_use_instr(src)->block == block;
+   return n;
+}
+
+/* Shared-base fold (Qween Plan 122 round 13), as Metal does: a buffer access
+ * base + zext((x + c) * 2^s), with c a constant, becomes base2 + c * 2^s at an
+ * immediate, base2 = base + sext(x) * 2^s, so accesses a constant apart share
+ * one base register instead of paying one 32-bit add each.
+ *
+ * Runs before agx_nir_fuse_lea, while the 32-bit amul still marks the offset as
+ * a descriptor buffer offset. Like fuse_lea's relaxed rules, it relies on a
+ * 32-bit amul offset being below INT32_MAX (hk sets maxStorageBufferRange to
+ * INT32_MAX for this; UBOs are smaller), so any in-bounds y = (x + c) mod 2^32
+ * is below 2^31. For 0 < c < 2^15 that makes sext(x) + c == y: either x >= -c
+ * as a signed integer, and the sum lands in [0, 2^32) and is y, or x < -c,
+ * which puts y at 2^31 + c or above. zext(x) + c would be wrong whenever x + c
+ * wraps, e.g. x = -1, c = 1.
+ *
+ * Robust access checks the wrapped 32-bit offset, which does not bound y. A
+ * robust load clamps x + c through a bcsel first, so it never matches. A
+ * robust UBO load under soft fault may match, but its result is selected on
+ * the original offset. A robust store sits inside its in-bounds if while x + c
+ * stays outside, so the same-block rule below keeps it unfolded.
+ *
+ * base2 holds two registers across its accesses, which costs threads, so it
+ * folds only when x has at least min_uses uses in the access's block and x + c
+ * is in that block too: CSE shares base2 within a block, while accesses split
+ * across if-arms or robust-store guards would each rebuild it (addrimm probe:
+ * 43 -> 47 instructions in a branch, 60 -> 92 for robust stores). Atomics keep
+ * their own path.
+ */
+static bool
+fold_shared_base(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const unsigned min_uses = *(const unsigned *)data;
+   if (intr->intrinsic != nir_intrinsic_load_global &&
+       intr->intrinsic != nir_intrinsic_load_global_constant &&
+       intr->intrinsic != nir_intrinsic_store_global)
+      return false;
+
+   unsigned bitsize = intr->intrinsic == nir_intrinsic_store_global
+                         ? nir_src_bit_size(intr->src[0])
+                         : intr->def.bit_size;
+   if (bitsize != 8 && bitsize != 16 && bitsize != 32)
+      return false;
+   unsigned format_shift = util_logbase2(bitsize / 8);
+
+   nir_src *addr_src = nir_get_io_offset_src(intr);
+   nir_scalar addr = nir_scalar_resolved(addr_src->ssa, 0);
+   if (!is_alu_op(addr, nir_op_iadd))
+      return false;
+
+   for (unsigned i = 0; i < 2; ++i) {
+      nir_scalar off = nir_scalar_chase_alu_src(addr, 1 - i);
+      if (!is_alu_op(off, nir_op_u2u64))
+         continue;
+
+      nir_scalar mul = nir_scalar_chase_alu_src(off, 0);
+      if (!is_alu_op(mul, nir_op_amul) || mul.def->bit_size != 32)
+         continue;
+
+      for (unsigned j = 0; j < 2; ++j) {
+         nir_scalar v = nir_scalar_chase_alu_src(mul, j);
+         nir_scalar y = nir_scalar_chase_alu_src(mul, 1 - j);
+         if (!nir_scalar_is_const(v) || !is_alu_op(y, nir_op_iadd))
+            continue;
+
+         /* The load lowering takes a shift of format to format + 2 */
+         uint32_t stride = nir_scalar_as_uint(v);
+         if (!util_is_power_of_two_nonzero(stride))
+            continue;
+         unsigned s = util_logbase2(stride);
+         if (s < format_shift || s > format_shift + 2)
+            continue;
+
+         for (unsigned k = 0; k < 2; ++k) {
+            nir_scalar c = nir_scalar_chase_alu_src(y, k);
+            nir_scalar x = nir_scalar_chase_alu_src(y, 1 - k);
+            if (!nir_scalar_is_const(c))
+               continue;
+
+            /* The immediate is signed 16-bit, and the proof needs c > 0 */
+            uint32_t imm = nir_scalar_as_uint(c);
+            if (imm == 0 || imm >= 0x8000 ||
+                nir_def_instr(y.def)->block != intr->instr.block ||
+                block_uses(x.def, intr->instr.block) < min_uses)
+               continue;
+
+            nir_scalar a = nir_scalar_chase_alu_src(addr, i);
+            b->cursor = nir_before_instr(&intr->instr);
+            nir_def *base2 = nir_ilea_agx(b, nir_channel(b, a.def, a.comp),
+                                          nir_channel(b, x.def, x.comp),
+                                          nir_imm_int(b, s));
+            nir_src_rewrite(addr_src, nir_ilea_agx(b, base2, nir_imm_int(b, imm),
+                                                   nir_imm_int(b, s)));
+            return true;
+         }
+      }
+   }
+
+   return false;
+}
+
 bool
 agx_nir_lower_address(nir_shader *nir)
 {
@@ -163,6 +278,12 @@ agx_nir_lower_address(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_dce);
    } while (progress);
+
+   if (agx_addr_imm_enabled()) {
+      unsigned min_uses = agx_addr_imm_min_uses();
+      NIR_PASS(progress, nir, nir_shader_intrinsics_pass, fold_shared_base,
+               nir_metadata_control_flow, &min_uses);
+   }
 
    /* Then, fuse as many lea as possible */
    NIR_PASS(progress, nir, agx_nir_fuse_lea);

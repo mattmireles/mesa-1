@@ -1675,6 +1675,12 @@ agx_emit_intrinsic(agx_builder *b, nir_intrinsic_instr *instr)
                             agx_src_index(&instr->src[1]));
    }
 
+   case nir_intrinsic_shuffle_xor: {
+      /* Constant: agx_nir_lower_subgroups lowers the other forms */
+      return agx_shuffle_xor_to(b, dst, agx_src_index(&instr->src[0]),
+                                agx_immediate(nir_src_as_uint(instr->src[1])));
+   }
+
    case nir_intrinsic_quad_broadcast: {
       /* TODO: Check if we're actually inside divergent control flow */
       b->shader->any_quad_divergent_shuffle |= b->shader->any_cf;

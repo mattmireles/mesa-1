@@ -6,6 +6,7 @@
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "util/list.h"
+#include "agx_compile.h"
 #include "agx_nir.h"
 #include "nir_builder_opcodes.h"
 #include "nir_intrinsics.h"
@@ -17,6 +18,30 @@ static nir_def *
 nir_udiv_round_up(nir_builder *b, nir_def *n, nir_def *d)
 {
    return nir_udiv(b, nir_iadd(b, n, nir_iadd_imm(b, d, -1)), d);
+}
+
+/* The hardware shuffle instruction chooses a single index within the target
+ * quad to shuffle each source quad with. Consequently, the low 2-bits of
+ * shuffle indices should not be quad divergent.  To implement arbitrary
+ * shuffle, pull each low 2-bits index in the quad separately.
+ */
+static nir_def *
+lower_shuffle(nir_builder *b, nir_def *data, nir_def *target)
+{
+   nir_def *quad_start = nir_iand_imm(b, target, 0x1c);
+   nir_def *result = NULL;
+
+   for (unsigned i = 0; i < 4; ++i) {
+      nir_def *target_i = nir_iadd_imm(b, quad_start, i);
+      nir_def *shuf = nir_read_invocation(b, data, target_i);
+
+      if (result)
+         result = nir_bcsel(b, nir_ieq(b, target, target_i), shuf, result);
+      else
+         result = shuf;
+   }
+
+   return result;
 }
 
 static bool
@@ -103,28 +128,32 @@ lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_shuffle: {
-      nir_def *data = intr->src[0].ssa;
-      nir_def *target = intr->src[1].ssa;
+      nir_def_rewrite_uses(&intr->def, lower_shuffle(b, intr->src[0].ssa,
+                                                     intr->src[1].ssa));
+      return true;
+   }
 
-      /* The hardware shuffle instruction chooses a single index within the
-       * target quad to shuffle each source quad with. Consequently, the low
-       * 2-bits of shuffle indices should not be quad divergent.  To implement
-       * arbitrary shuffle, pull each low 2-bits index in the quad separately.
+   case nir_intrinsic_shuffle_xor:
+      /* A constant xor below the subgroup size is one hardware shuffle_xor
+       * (agx_compile.c); its immediate is 8 bits, so a larger constant must
+       * not reach the packer.
        */
-      nir_def *quad_start = nir_iand_imm(b, target, 0x1c);
-      nir_def *result = NULL;
+      if (nir_src_is_const(intr->src[1]) && nir_src_as_uint(intr->src[1]) < 32)
+         return false;
 
-      for (unsigned i = 0; i < 4; ++i) {
-         nir_def *target_i = nir_iadd_imm(b, quad_start, i);
-         nir_def *shuf = nir_read_invocation(b, data, target_i);
+      FALLTHROUGH;
+   case nir_intrinsic_shuffle_up:
+   case nir_intrinsic_shuffle_down: {
+      nir_def *id = nir_load_subgroup_invocation(b);
+      nir_def *delta = intr->src[1].ssa;
+      nir_def *target = intr->intrinsic == nir_intrinsic_shuffle_xor
+                           ? nir_ixor(b, id, delta)
+                        : intr->intrinsic == nir_intrinsic_shuffle_up
+                           ? nir_isub(b, id, delta)
+                           : nir_iadd(b, id, delta);
 
-         if (result)
-            result = nir_bcsel(b, nir_ieq(b, target, target_i), shuf, result);
-         else
-            result = shuf;
-      }
-
-      nir_def_rewrite_uses(&intr->def, result);
+      nir_def_rewrite_uses(&intr->def,
+                           lower_shuffle(b, intr->src[0].ssa, target));
       return true;
    }
 
@@ -217,7 +246,7 @@ agx_nir_lower_subgroups(nir_shader *s)
       .lower_read_first_invocation = true,
       .lower_inverse_ballot = true,
       .lower_to_scalar = true,
-      .lower_relative_shuffle = true,
+      .lower_relative_shuffle = !agx_shuffle_xor_enabled(),
       .lower_rotate_to_shuffle = true,
       .lower_subgroup_masks = true,
       .lower_reduce = true,

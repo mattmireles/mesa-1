@@ -105,7 +105,12 @@ hk_physical_device_compiler_flags(const struct hk_physical_device *pdev)
          ((uint64_t)(getenv("AGX_DECODE_Q4") != NULL) << 33) |
          ((uint64_t)(getenv("AGX_HWMAT_VEC2_OFF") != NULL) << 34) |
          ((uint64_t)(getenv("AGX_LOCAL_FOLD_OFF") != NULL) << 35) |
-         ((uint64_t)(getenv("AGX_SCHED_COMPUTE") != NULL) << 36);
+         ((uint64_t)(getenv("AGX_SCHED_COMPUTE") != NULL) << 36) |
+         ((uint64_t)!agx_shuffle_xor_enabled() << 37) |
+         ((uint64_t)!debug_get_bool_option("AGX_SIMDMAT_FOLD", true) << 38) |
+         ((uint64_t)!debug_get_bool_option("AGX_WAIT_GLOBAL", true) << 39) |
+         ((uint64_t)!agx_addr_imm_enabled() << 40) |
+         ((uint64_t)agx_addr_imm_min_uses() << 41);
 }
 
 const nir_shader_compiler_options *

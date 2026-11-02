@@ -332,6 +332,35 @@ agx_simdmat_enabled(void)
 {
    return debug_get_bool_option("AGX_SIMDMAT", true);
 }
+
+/* A constant-index subgroup shuffle_xor below 32 is one hardware shuffle_xor.
+ * AGX_SHUFFLE_XOR=0 restores the upstream lowering (4 shuffles and selects per
+ * lane). Part of hk_physical_device_compiler_flags, so it is in the shader
+ * cache key.
+ */
+static inline bool
+agx_shuffle_xor_enabled(void)
+{
+   return debug_get_bool_option("AGX_SHUFFLE_XOR", true);
+}
+
+/* Shared-base address fold in agx_nir_lower_address: buffer loads and stores at
+ * x + c share one base register and take c as the immediate. AGX_ADDR_IMM=0
+ * restores upstream; it folds only when x has at least AGX_ADDR_IMM_MIN uses
+ * (default 8). Both are part of hk_physical_device_compiler_flags, so they are
+ * in the shader cache key.
+ */
+static inline bool
+agx_addr_imm_enabled(void)
+{
+   return debug_get_bool_option("AGX_ADDR_IMM", true);
+}
+
+static inline unsigned
+agx_addr_imm_min_uses(void)
+{
+   return CLAMP(debug_get_num_option("AGX_ADDR_IMM_MIN", 8), 0, 0xffff);
+}
 bool agx_nir_lower_discard_zs_emit(nir_shader *s);
 bool agx_nir_lower_sample_mask(nir_shader *s);
 bool agx_nir_lower_interpolation(nir_shader *s);

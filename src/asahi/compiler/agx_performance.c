@@ -104,6 +104,7 @@ struct alu_timing op_timings[] = {
    [AGX_OPCODE_QUAD_REDUCE]      = { SCIB, 24, 24 },
    [AGX_OPCODE_SHUFFLE]          = { SCIB, 5, 2   },
    [AGX_OPCODE_QUAD_SHUFFLE]     = { SCIB, 5, 2   },
+   [AGX_OPCODE_SHUFFLE_XOR]      = { SCIB, 5, 2   },
 
    [AGX_OPCODE_ICMP_BALLOT]      = { SCIB, 5, 2   },
    [AGX_OPCODE_FCMP_BALLOT]      = { SCIB, 5, 2   },
