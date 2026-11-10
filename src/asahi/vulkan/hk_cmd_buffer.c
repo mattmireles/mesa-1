@@ -369,6 +369,23 @@ hk_CmdPipelineBarrier2(VkCommandBuffer commandBuffer,
          return;
    }
 
+   /* Qween Plan 122 Round 47: with the deferred CDM flush, ending the compute
+    * batch at each barrier gave every following launch a fresh control stream,
+    * whose 64 KiB root chunk filled most of a 128 KiB command BO (about one BO
+    * a dispatch; 256 BOs, 32 MiB, a recorded pass). Outside a render pass,
+    * emit the batch-end barrier in place and keep the stream open: the same
+    * launches and barriers in the same order, without the stream links
+    * merge_control_streams would add. A stream carrying a timestamp or
+    * queued immediate writes still ends here.
+    */
+   struct hk_cs *open_cs = cmd->current_cs.cs;
+   if (dev->cdm_defer_flush && open_cs && !open_cs->timestamp.end.addr &&
+       !open_cs->imm_writes.size && !cmd->current_cs.gfx &&
+       !cmd->current_cs.pre_gfx && !cmd->current_cs.post_gfx) {
+      hk_cs_finish_pending_flush(cmd, open_cs);
+      return;
+   }
+
    hk_cmd_buffer_end_compute(cmd);
    hk_cmd_buffer_end_graphics(cmd);
 }
