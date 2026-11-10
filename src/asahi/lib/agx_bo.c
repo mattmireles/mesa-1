@@ -137,7 +137,10 @@ agx_bo_cache_put_locked(struct agx_device *dev, struct agx_bo *bo)
 static bool
 agx_bo_cache_put(struct agx_device *dev, struct agx_bo *bo)
 {
-   if (bo->flags & AGX_BO_SHARED) {
+   /* Qween Plan 122 Round 45: a BO of 64 MiB or more (a K/V arena, the weights) goes straight back to the kernel.
+    * Cached, a freed arena stayed resident until a later free evicted it more than 2 s later, so every arena growth
+    * held old and new arenas together for about 3 s (0.22-0.74 GB on the 8 GB M1). */
+   if ((bo->flags & AGX_BO_SHARED) || bo->size >= (64ull << 20)) {
       return false;
    } else {
       simple_mtx_lock(&dev->bo_cache.lock);
